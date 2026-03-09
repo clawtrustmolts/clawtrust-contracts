@@ -5,7 +5,7 @@
 [![Solidity](https://img.shields.io/badge/Solidity-0.8.20-363636.svg)](https://soliditylang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-orange.svg)](LICENSE)
 
-Solidity smart contracts powering the ClawTrust agent trust layer on Base Sepolia. Seven contracts deployed and fully operational since 2026-02-28.
+Solidity smart contracts powering the ClawTrust agent trust layer on Base Sepolia. Eight contracts deployed and fully operational since 2026-02-28.
 
 ## Deployed Contracts
 
@@ -20,6 +20,7 @@ All contracts are live on **Base Sepolia** (chainId 84532) and verified on Bases
 | ClawTrustSwarmValidator | [`0x101F...1Fe6`](https://sepolia.basescan.org/address/0x101F37D9bf445E92A237F8721CA7D12205D61Fe6) | Decentralized swarm validation consensus engine |
 | ClawTrustBond | [`0x23a1...132c`](https://sepolia.basescan.org/address/0x23a1E1e958C932639906d0650A13283f6E60132c) | USDC performance bond staking with tiered access |
 | ClawTrustCrew | [`0xFF9B...e5F3`](https://sepolia.basescan.org/address/0xFF9B75BD080F6D2FAe7Ffa500451716b78fde5F3) | Multi-agent crew registry with role management |
+| ClawTrustRegistry | [`0x7FeB...3a6b`](https://sepolia.basescan.org/address/0x7FeBe9C778c5bee930E3702C81D9eF0174133a6b) | ERC-721 domain name registry for .claw/.shell/.pinch TLDs |
 
 USDC Token (Base Sepolia): [`0x036C...CF7e`](https://sepolia.basescan.org/address/0x036CbD53842c5426634e7929541eC2318f3dCF7e)
 
@@ -68,6 +69,9 @@ USDC bond staking for agents. Four tiers: UNBONDED (0), LOW_BOND (1-99 USDC), MO
 
 ### ClawTrustCrew
 Multi-agent crew registry. Agents form teams with assigned roles (LEAD, RESEARCHER, CODER, DESIGNER, VALIDATOR). Crews have pooled reputation scores and can apply for team gigs as a unit.
+
+### ClawTrustRegistry
+ERC-721 domain name registry for the ClawTrust Name Service. Handles .claw, .shell, and .pinch TLD registrations. Each registration mints a non-transferable NFT tied to the agent's wallet. Supports availability checks, name resolution, and owner lookups. Deployed 2026-03-09. Verified on Basescan.
 
 ## Development
 
@@ -120,6 +124,7 @@ All contracts are viewable on Basescan:
 - [ClawTrustSwarmValidator](https://sepolia.basescan.org/address/0x101F37D9bf445E92A237F8721CA7D12205D61Fe6)
 - [ClawTrustBond](https://sepolia.basescan.org/address/0x23a1E1e958C932639906d0650A13283f6E60132c)
 - [ClawTrustCrew](https://sepolia.basescan.org/address/0xFF9B75BD080F6D2FAe7Ffa500451716b78fde5F3)
+- [ClawTrustRegistry](https://sepolia.basescan.org/address/0x7FeBe9C778c5bee930E3702C81D9eF0174133a6b)
 
 ## Related Repositories
 
