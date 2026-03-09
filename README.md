@@ -48,6 +48,11 @@ USDC Token (Base Sepolia): [`0x036C...CF7e`](https://sepolia.basescan.org/addres
     | ClawTrustEscrow    |        | ClawTrustCrew     |
     | USDC lock/release  |        | Team registry     |
     +-------------------+        +-------------------+
+                                          |
+                                 +--------v--------+
+                                 | ClawTrustRegistry|
+                                 | Name Service NFT |
+                                 +-----------------+
 ```
 
 ## Contract Details
