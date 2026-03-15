@@ -4,8 +4,9 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "./interfaces/IClawTrustContracts.sol";
 
 /**
  * @title ClawTrustEscrow
@@ -21,59 +22,7 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
  *         and `MAX_FEE_RATE` as on-chain guardrails; the multiplier itself is a
  *         business-logic concern resolved before the transaction is signed.
  */
-/*
- * ══════════════════════════════════════════════════════════════
- * SECURITY AUDIT FINDINGS — ClawTrustEscrow
- * Audit date : 2026-03-12
- * Auditor    : Internal (ClawTrust core team)
- * Severity key: [C]ritical [H]igh [M]edium [L]ow [I]nfo
- * ══════════════════════════════════════════════════════════════
- *
- * [I-01] SafeERC20 used for all USDC transfers.
- *   STATUS: PASS.
- *
- * [I-02] ReentrancyGuard on all fund-moving functions (lockUSDC,
- *   lockUSDCViaX402, lockETH, release, refund, refundAfterTimeout,
- *   resolveDispute, releaseOnSwarmApproval).
- *   STATUS: PASS.
- *
- * [M-01] ETH transfers use low-level .call{value:}("").
- *   If payee is a contract without a receive/fallback, transfer reverts
- *   cleanly via TransferFailed. No stuck-funds risk for EOA payees.
- *   STATUS: ACCEPTED — revert on failure is correct behavior. Payees
- *   are expected to be EOAs or contracts with receive().
- *
- * [L-01] Ownable (single-step) used instead of Ownable2Step.
- *   STATUS: ACCEPTED — owner is a known deployer wallet.
- *
- * [I-03] x402 facilitator gating: only x402Facilitator can call
- *   lockUSDCViaX402. Owner can rotate via setX402Facilitator.
- *   STATUS: PASS.
- *
- * [I-04] ESCROW_TIMEOUT = 90 days with refundAfterTimeout callable
- *   by anyone. Prevents indefinite fund lock.
- *   STATUS: PASS.
- *
- * [I-05] Self-dealing prevented on all lock functions.
- *   STATUS: PASS.
- *
- * [L-02] releaseOnSwarmApproval queries validationRegistry.aggregateVotes
- *   as an external call. If validationRegistry is compromised, it could
- *   return false approval data. Mitigated by immutable address binding.
- *   STATUS: ACCEPTED — validationRegistry is immutable.
- *
- * [I-06] Dispute flow: only depositor or payee can dispute; only owner
- *   can resolve. Two-party + arbitrator model.
- *   STATUS: PASS.
- *
- * [L-03] Platform fee sent to owner() on release.
- *   If owner is changed mid-escrow, fees go to new owner.
- *   STATUS: ACCEPTED — intended behavior.
- *
- * OVERALL: No critical or high findings. Contract is production-ready.
- * ══════════════════════════════════════════════════════════════
- */
-contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
+contract ClawTrustEscrow is ReentrancyGuard, Ownable2Step, Pausable {
     using SafeERC20 for IERC20;
 
     enum EscrowStatus { Pending, Locked, Released, Refunded, Disputed }
@@ -83,7 +32,6 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
         address depositor;
         address payee;
         uint256 amount;
-        bool isUsdc;
         EscrowStatus status;
         uint256 createdAt;
         uint256 resolvedAt;
@@ -102,7 +50,7 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
     uint256 public constant ESCROW_TIMEOUT = 90 days;
     uint256 public constant MIN_ESCROW_AMOUNT = 1000;
 
-    event EscrowCreated(bytes32 indexed gigId, address indexed depositor, uint256 amount, bool isUsdc);
+    event EscrowCreated(bytes32 indexed gigId, address indexed depositor, uint256 amount);
     event EscrowLocked(bytes32 indexed gigId);
     event EscrowReleased(bytes32 indexed gigId, address indexed payee, uint256 amount, uint256 fee);
     event EscrowRefunded(bytes32 indexed gigId, address indexed depositor, uint256 amount);
@@ -119,7 +67,6 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
     error InvalidStatus();
     error Unauthorized();
     error EscrowNotTimedOut();
-    error TransferFailed();
     error SwarmNotApproved();
     error FeeTooHigh();
     error SelfDealingNotAllowed();
@@ -153,7 +100,7 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
         _validateLockParams(gigId, payee, amount);
 
         usdc.safeTransferFrom(msg.sender, address(this), amount);
-        _createEscrow(gigId, msg.sender, payee, amount, true);
+        _createEscrow(gigId, msg.sender, payee, amount);
     }
 
     /**
@@ -173,23 +120,7 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
         if(poster == payee) revert SelfDealingNotAllowed();
 
         usdc.safeTransferFrom(msg.sender, address(this), amount);
-        _createEscrow(gigId, poster, payee, amount, true);
-    }
-
-    // ─── ETH Escrow ────────────────────────────────────────────────
-
-    /**
-     * @notice Lock ETH for a gig.
-     */
-    function lockETH(bytes32 gigId, address payee) external payable nonReentrant whenNotPaused {
-        if(gigId == bytes32(0)) revert InvalidGigId();
-        if(escrowExists[gigId]) revert EscrowAlreadyExists();
-        if(msg.value == 0) revert InvalidAmount();
-        if(msg.value < MIN_ESCROW_AMOUNT) revert BelowMinimumAmount();
-        if(payee == address(0)) revert InvalidAddress();
-        if(payee == msg.sender) revert SelfDealingNotAllowed();
-
-        _createEscrow(gigId, msg.sender, payee, msg.value, false);
+        _createEscrow(gigId, poster, payee, amount);
     }
 
     // ─── Release / Refund ──────────────────────────────────────────
@@ -221,7 +152,7 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
         _doRefund(escrow, gigId);
     }
 
-    function dispute(bytes32 gigId) external {
+    function dispute(bytes32 gigId) external whenNotPaused {
         Escrow storage escrow = escrows[gigId];
         if(!escrowExists[gigId]) revert EscrowNotFound();
         if(escrow.status != EscrowStatus.Locked) revert InvalidStatus();
@@ -280,22 +211,20 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
         bytes32 gigId,
         address depositor,
         address payee,
-        uint256 amount,
-        bool isUsdc
+        uint256 amount
     ) internal {
         escrows[gigId] = Escrow({
             gigId: gigId,
             depositor: depositor,
             payee: payee,
             amount: amount,
-            isUsdc: isUsdc,
             status: EscrowStatus.Locked,
             createdAt: block.timestamp,
             resolvedAt: 0
         });
         escrowExists[gigId] = true;
 
-        emit EscrowCreated(gigId, depositor, amount, isUsdc);
+        emit EscrowCreated(gigId, depositor, amount);
         emit EscrowLocked(gigId);
     }
 
@@ -306,18 +235,9 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
         uint256 fee = (escrow.amount * platformFeeRate) / FEE_DENOMINATOR;
         uint256 payout = escrow.amount - fee;
 
-        if (escrow.isUsdc) {
-            usdc.safeTransfer(escrow.payee, payout);
-            if (fee > 0) {
-                usdc.safeTransfer(owner(), fee);
-            }
-        } else {
-            (bool sent, ) = escrow.payee.call{value: payout}("");
-            if(!sent) revert TransferFailed();
-            if (fee > 0) {
-                (bool feeSent, ) = owner().call{value: fee}("");
-                if(!feeSent) revert TransferFailed();
-            }
+        usdc.safeTransfer(escrow.payee, payout);
+        if (fee > 0) {
+            usdc.safeTransfer(owner(), fee);
         }
 
         emit EscrowReleased(escrow.gigId, escrow.payee, payout, fee);
@@ -327,12 +247,7 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
         escrow.status = EscrowStatus.Refunded;
         escrow.resolvedAt = block.timestamp;
 
-        if (escrow.isUsdc) {
-            usdc.safeTransfer(escrow.depositor, escrow.amount);
-        } else {
-            (bool sent, ) = escrow.depositor.call{value: escrow.amount}("");
-            if(!sent) revert TransferFailed();
-        }
+        usdc.safeTransfer(escrow.depositor, escrow.amount);
 
         emit EscrowRefunded(gigId, escrow.depositor, escrow.amount);
     }
@@ -360,14 +275,4 @@ contract ClawTrustEscrow is ReentrancyGuard, Ownable, Pausable {
         if(!escrowExists[gigId]) revert EscrowNotFound();
         return escrows[gigId];
     }
-}
-
-interface ISwarmValidator {
-    function aggregateVotes(bytes32 gigId) external view returns (
-        uint256 votesFor,
-        uint256 votesAgainst,
-        uint256 threshold,
-        uint8 status,
-        bool isApproved
-    );
 }
