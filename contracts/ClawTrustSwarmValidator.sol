@@ -1,70 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
-/*
- * ══════════════════════════════════════════════════════════════
- * SECURITY AUDIT FINDINGS — ClawTrustSwarmValidator
- * Audit date : 2026-03-12
- * Auditor    : Internal (ClawTrust core team)
- * Severity key: [C]ritical [H]igh [M]edium [L]ow [I]nfo
- * ══════════════════════════════════════════════════════════════
- *
- * [I-01] ReentrancyGuard on vote() and claimReward().
- *   STATUS: PASS.
- *
- * [I-02] SafeERC20 used for all ERC-20 reward transfers.
- *   STATUS: PASS.
- *
- * [I-03] Candidate-gated voting: only registered candidates can vote.
- *   AssigneeCannotValidate and PosterCannotValidate prevent
- *   interested-party voting.
- *   STATUS: PASS.
- *
- * [I-04] AlreadyVoted check prevents double-voting.
- *   STATUS: PASS.
- *
- * [I-05] MAX_CANDIDATES = 50 limits gas cost of createValidation.
- *   STATUS: PASS.
- *
- * [L-01] Ownable (single-step) used instead of Ownable2Step.
- *   STATUS: ACCEPTED — owner is a known deployer wallet.
- *
- * [L-02] ETH reward transfers use low-level .call{value:}("").
- *   If recipient is a contract without receive(), transfer reverts
- *   with TransferFailed. Validator reward goes unclaimed.
- *   STATUS: ACCEPTED — validators are expected to be EOAs.
- *
- * [L-03] Reward per validator computed as rewardPool / votesFor.
- *   Integer division may leave dust. sweepResidualRewards() allows
- *   owner to recover this dust.
- *   STATUS: PASS — dust recovery mechanism exists.
- *
- * [I-06] Validation expiry: VALIDATION_DURATION = 7 days.
- *   Expired validations refund the reward pool to escrowContract.
- *   STATUS: PASS.
- *
- * [I-07] onlyEscrowOrOwner modifier gates createValidation.
- *   STATUS: PASS.
- *
- * [L-04] DuplicateCandidate check in createValidation loop.
- *   O(n) isCandidate mapping lookup per candidate. Gas cost bounded
- *   by MAX_CANDIDATES = 50.
- *   STATUS: ACCEPTED.
- *
- * [M-01] ETH overpayment could get stranded in contract.
- *   createValidation ETH path only required msg.value >= rewardPool.
- *   Surplus ETH would be permanently locked since no generic withdrawal.
- *   STATUS: FIXED — changed to require msg.value == rewardPool (exact).
- *
- * OVERALL: No critical or high findings. Contract is production-ready.
- * ══════════════════════════════════════════════════════════════
- */
-contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
+contract ClawTrustSwarmValidator is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     enum VoteType { None, Approve, Reject }
@@ -87,6 +30,7 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
         uint256 rewardPool;
         uint256 rewardPoolClaimed;
         address rewardToken;
+        address escrowSnapshot;
         mapping(address => bool) rewardClaimed;
     }
 
@@ -112,6 +56,7 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
     address public escrowContract;
     uint256 public constant MAX_CANDIDATES = 50;
     uint256 public constant VALIDATION_DURATION = 7 days;
+    uint256 public constant SWEEP_CLAIM_WINDOW = 14 days;
     uint256 public defaultThreshold = 3;
     uint256 public defaultCandidateCount = 5;
 
@@ -175,19 +120,16 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
         uint256 threshold,
         uint256 rewardPool,
         address rewardToken
-    ) external payable onlyEscrowOrOwner {
+    ) external onlyEscrowOrOwner whenNotPaused {
         if(validationExists[gigId]) revert ValidationAlreadyExists();
         if(poster == address(0)) revert InvalidAddress();
         if(candidates.length > MAX_CANDIDATES) revert TooManyCandidates();
         if(candidates.length < threshold) revert InsufficientCandidates();
         if(threshold == 0) revert InvalidThreshold();
+        if(rewardToken == address(0)) revert InvalidAddress();
 
-        if(rewardToken == address(0)) {
-            if(msg.value != rewardPool) revert InsufficientRewardPool();
-        } else {
-            if(rewardPool > 0) {
-                IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), rewardPool);
-            }
+        if(rewardPool > 0) {
+            IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), rewardPool);
         }
 
         ValidationRequest storage v = validations[gigId];
@@ -200,6 +142,7 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
         v.expiresAt = block.timestamp + VALIDATION_DURATION;
         v.rewardPool = rewardPool;
         v.rewardToken = rewardToken;
+        v.escrowSnapshot = escrowContract;
 
         for (uint256 i = 0; i < candidates.length; i++) {
             address candidate = candidates[i];
@@ -217,13 +160,12 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
         emit ValidationCreated(gigId, assignee, candidates, threshold, rewardPool, rewardToken, v.expiresAt);
     }
 
-    function vote(bytes32 gigId, VoteType _vote) external nonReentrant {
+    function vote(bytes32 gigId, VoteType _vote) external nonReentrant whenNotPaused {
         if(!validationExists[gigId]) revert ValidationNotFound();
         ValidationRequest storage v = validations[gigId];
 
         if(v.status != ValidationStatus.Pending) revert ValidationAlreadyResolved();
         if(block.timestamp >= v.expiresAt) {
-            _expireValidation(gigId);
             revert ValidationAlreadyResolved();
         }
         if(_vote != VoteType.Approve && _vote != VoteType.Reject) revert InvalidVote();
@@ -285,12 +227,7 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
         if(amount == 0) return;
         v.rewardPoolClaimed = v.rewardPool;
 
-        if(v.rewardToken == address(0)) {
-            (bool success, ) = escrowContract.call{value: amount}("");
-            if(!success) revert TransferFailed();
-        } else {
-            IERC20(v.rewardToken).safeTransfer(escrowContract, amount);
-        }
+        IERC20(v.rewardToken).safeTransfer(v.escrowSnapshot, amount);
     }
 
     function claimReward(bytes32 gigId) external nonReentrant {
@@ -314,12 +251,7 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
         v.rewardClaimed[msg.sender] = true;
         v.rewardPoolClaimed += rewardPerValidator;
 
-        if(v.rewardToken == address(0)) {
-            (bool success, ) = msg.sender.call{value: rewardPerValidator}("");
-            if(!success) revert TransferFailed();
-        } else {
-            IERC20(v.rewardToken).safeTransfer(msg.sender, rewardPerValidator);
-        }
+        IERC20(v.rewardToken).safeTransfer(msg.sender, rewardPerValidator);
 
         emit RewardClaimed(gigId, msg.sender, rewardPerValidator);
     }
@@ -389,6 +321,9 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
         defaultCandidateCount = _count;
     }
 
+    function pause() external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
+
     function setEscrowContract(address _escrow) external onlyOwner {
         if(_escrow == address(0)) revert InvalidAddress();
         address oldEscrow = escrowContract;
@@ -396,31 +331,21 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
         emit EscrowContractUpdated(oldEscrow, _escrow);
     }
 
-    /**
-     * @notice Sweep residual reward dust that can never be claimed due to integer division.
-     *         Callable only by the owner after all validators with `Approve` votes have
-     *         had the opportunity to claim (i.e. rewardPoolClaimed approaches rewardPool).
-     *         Sends remainder to `to`, preventing funds from being permanently locked.
-     * @param gigId  The gig whose residual is being swept.
-     * @param to     Recipient of the dust (typically a treasury or the escrow contract).
-     */
+    error SweepTooEarly();
+
     function sweepResidualRewards(bytes32 gigId, address to) external onlyOwner nonReentrant {
         if(!validationExists[gigId]) revert ValidationNotFound();
         if(to == address(0)) revert InvalidAddress();
         ValidationRequest storage v = validations[gigId];
         if(v.status != ValidationStatus.Approved) revert ValidationNotApproved();
+        if(block.timestamp < v.resolvedAt + SWEEP_CLAIM_WINDOW) revert SweepTooEarly();
 
         uint256 residual = v.rewardPool - v.rewardPoolClaimed;
         if(residual == 0) revert NoRewardAvailable();
 
         v.rewardPoolClaimed += residual;
 
-        if(v.rewardToken == address(0)) {
-            (bool success, ) = to.call{value: residual}("");
-            if(!success) revert TransferFailed();
-        } else {
-            IERC20(v.rewardToken).safeTransfer(to, residual);
-        }
+        IERC20(v.rewardToken).safeTransfer(to, residual);
 
         emit ResidualRewardSwept(gigId, to, residual);
     }
@@ -428,6 +353,4 @@ contract ClawTrustSwarmValidator is Ownable, ReentrancyGuard {
     function computeRewardPool(uint256 gigBudget, uint256 rewardRate, uint256 denominator) external pure returns (uint256) {
         return (gigBudget * rewardRate) / denominator;
     }
-
-    receive() external payable {}
 }
