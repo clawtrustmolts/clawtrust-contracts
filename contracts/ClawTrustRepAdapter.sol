@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./interfaces/IERC8004Reputation.sol";
@@ -12,74 +12,23 @@ import "./interfaces/IERC8004Reputation.sol";
  *         Implements IERC8004Reputation and supports ERC-8004 feedback model.
  *
  *         FusedScore formula (sum = 100):
- *           onChain        45%
- *           moltbookKarma  25%
- *           performance    20%
- *           bondReliability 10%
+ *           performance    35%
+ *           onChain        30%
+ *           bondReliability 20%
+ *           moltbook/ecosystem 15%
  */
-/*
- * ══════════════════════════════════════════════════════════════
- * SECURITY AUDIT FINDINGS — ClawTrustRepAdapter
- * Audit date : 2026-03-12
- * Auditor    : Internal (ClawTrust core team)
- * Severity key: [C]ritical [H]igh [M]edium [L]ow [I]nfo
- * ══════════════════════════════════════════════════════════════
- *
- * [I-01] ReentrancyGuard on submitFeedback and submitFusedFeedback.
- *   STATUS: PASS.
- *
- * [I-02] Oracle-gated writes: onlyOracle modifier on all score
- *   mutation functions.
- *   STATUS: PASS.
- *
- * [I-03] Rate limiting via rateLimited modifier (1 hour cooldown).
- *   STATUS: PASS.
- *
- * [I-04] Bounds checking on all 4 score components:
- *   onChainScore ≤ 1000, moltbookKarma ≤ 10000,
- *   performanceScore ≤ 100, bondScore ≤ 100.
- *   STATUS: PASS.
- *
- * [I-05] FusedScore formula uses integer math with assert(fused ≤ 100).
- *   No overflow possible given max inputs and weight denominator = 100.
- *   STATUS: PASS.
- *
- * [L-01] Ownable (single-step) used instead of Ownable2Step.
- *   STATUS: ACCEPTED — owner is a known deployer wallet.
- *
- * [L-02] Batch update silently skips rate-limited agents (continue).
- *   Could lead to partial updates without notification to caller.
- *   STATUS: ACCEPTED — by design; callers should check timestamps.
- *
- * [L-03] History pruning in _appendHistory uses O(n) shift.
- *   At MAX_HISTORY_LENGTH = 500 this costs ~15k gas per prune.
- *   STATUS: ACCEPTED — bounded cost, infrequent occurrence.
- *
- * [I-06] submitFeedback forwards to external reputationRegistry
- *   via try/catch. Failure is logged but does not revert.
- *   STATUS: PASS — graceful degradation.
- *
- * [I-07] Proof verification via keccak256 hash comparison.
- *   STATUS: PASS.
- *
- * [I-08] Pausable on all mutation functions.
- *   STATUS: PASS.
- *
- * OVERALL: No critical or high findings. Contract is production-ready.
- * ══════════════════════════════════════════════════════════════
- */
-contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Reputation {
-    uint256 public constant ON_CHAIN_WEIGHT       = 45;
-    uint256 public constant MOLTBOOK_WEIGHT       = 25;
-    uint256 public constant PERFORMANCE_WEIGHT    = 20;
-    uint256 public constant BOND_WEIGHT           = 10;
+contract ClawTrustRepAdapter is Ownable2Step, Pausable, ReentrancyGuard, IERC8004Reputation {
+    uint256 public constant PERFORMANCE_WEIGHT    = 35;
+    uint256 public constant ON_CHAIN_WEIGHT       = 30;
+    uint256 public constant BOND_WEIGHT           = 20;
+    uint256 public constant MOLTBOOK_WEIGHT       = 15;
     uint256 public constant WEIGHT_DENOMINATOR    = 100;
 
     uint256 public constant MAX_ON_CHAIN_SCORE    = 1000;
     uint256 public constant MAX_MOLTBOOK_KARMA    = 10000;
     uint256 public constant MAX_PERFORMANCE_SCORE = 100;
     uint256 public constant MAX_BOND_SCORE        = 100;
-    uint256 public constant UPDATE_COOLDOWN       = 1 hours;
+    uint256 public updateCooldown                 = 5 minutes;
     uint256 public constant MAX_SCORE             = 100;
     uint256 public constant MAX_BATCH_SIZE        = 50;
     uint256 public constant MAX_HISTORY_LENGTH    = 500;
@@ -103,6 +52,7 @@ contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Repu
     mapping(address => ScoreHistory[]) public scoreHistory;
     mapping(address => bool) public authorizedOracles;
     mapping(address => uint256) public lastUpdateTime;
+    mapping(address => uint256) public historyHead;
 
     // ERC-8004 feedback storage
     mapping(address => Feedback[]) internal _feedbacks;
@@ -141,7 +91,7 @@ contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Repu
     }
 
     modifier rateLimited(address agent) {
-        if(block.timestamp < lastUpdateTime[agent] + UPDATE_COOLDOWN) {
+        if(block.timestamp < lastUpdateTime[agent] + updateCooldown) {
             revert UpdateTooSoon();
         }
         _;
@@ -181,7 +131,7 @@ contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Repu
             BOND_WEIGHT        * bondScore
         ) / WEIGHT_DENOMINATOR;
 
-        assert(fused <= MAX_SCORE);
+        if(fused > MAX_SCORE) revert ScoreOutOfBounds();
         return fused;
     }
 
@@ -194,7 +144,7 @@ contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Repu
         string calldata proofUri
     ) external onlyOracle whenNotPaused rateLimited(agent) {
         if(agent == address(0)) revert InvalidAddress();
-        if(bytes(proofUri).length == 0) revert InvalidProof();
+        if(bytes(proofUri).length < 10) revert InvalidProof();
 
         uint256 fused = computeFusedScore(onChainScore, moltbookKarma, performanceScore, bondScore);
         bytes32 proofHash = keccak256(bytes(proofUri));
@@ -235,7 +185,7 @@ contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Repu
         for(uint256 i = 0; i < length; i++) {
             address agent = agents[i];
             if(agent == address(0)) revert InvalidAddress();
-            if(block.timestamp < lastUpdateTime[agent] + UPDATE_COOLDOWN) continue;
+            if(block.timestamp < lastUpdateTime[agent] + updateCooldown) continue;
 
             uint256 fused = computeFusedScore(onChainScores[i], moltbookKarmas[i], performanceScores[i], bondScores[i]);
             bytes32 proofHash = keccak256(bytes(proofUris[i]));
@@ -271,7 +221,7 @@ contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Repu
         string calldata proofUri
     ) external override onlyOracle whenNotPaused nonReentrant {
         if(to == address(0)) revert InvalidAddress();
-        if(bytes(proofUri).length == 0) revert InvalidProof();
+        if(bytes(proofUri).length < 10) revert InvalidProof();
 
         _feedbacks[to].push(Feedback({
             from: msg.sender,
@@ -349,7 +299,7 @@ contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Repu
         string calldata proofUri
     ) external onlyOracle whenNotPaused rateLimited(agentAddress) nonReentrant {
         if(agentAddress == address(0)) revert InvalidAddress();
-        if(bytes(proofUri).length == 0) revert InvalidProof();
+        if(bytes(proofUri).length < 10) revert InvalidProof();
 
         uint256 fused = computeFusedScore(onChainScore, moltbookKarma, performanceScore, bondScore);
         bytes32 proofHash = keccak256(bytes(proofUri));
@@ -384,19 +334,15 @@ contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Repu
 
     function _appendHistory(address agent, uint256 fused) internal {
         ScoreHistory[] storage history = scoreHistory[agent];
+        ScoreHistory memory entry = ScoreHistory({ fusedScore: fused, timestamp: block.timestamp });
 
-        if(history.length >= MAX_HISTORY_LENGTH) {
-            uint256 pruneCount = history.length - MAX_HISTORY_LENGTH + 1;
-            for(uint256 i = 0; i < history.length - pruneCount; i++) {
-                history[i] = history[i + pruneCount];
-            }
-            for(uint256 i = 0; i < pruneCount; i++) {
-                history.pop();
-            }
-            emit ScoreHistoryPruned(agent, pruneCount);
+        if(history.length < MAX_HISTORY_LENGTH) {
+            history.push(entry);
+        } else {
+            uint256 idx = historyHead[agent] % MAX_HISTORY_LENGTH;
+            history[idx] = entry;
+            historyHead[agent]++;
         }
-
-        history.push(ScoreHistory({ fusedScore: fused, timestamp: block.timestamp }));
     }
 
     function getFusedScore(address agent) external view returns (FusedScore memory) {
@@ -446,10 +392,13 @@ contract ClawTrustRepAdapter is Ownable, Pausable, ReentrancyGuard, IERC8004Repu
 
     function setMinOracleCount(uint256 _minCount) external onlyOwner {
         if(_minCount == 0) revert InvalidScore();
-        if(_minCount > oracleCount) revert InsufficientOracles();
         uint256 oldCount = minOracleCount;
         minOracleCount = _minCount;
         emit MinOracleCountUpdated(oldCount, _minCount);
+    }
+
+    function setUpdateCooldown(uint256 _cooldown) external onlyOwner {
+        updateCooldown = _cooldown;
     }
 
     function pause() external onlyOwner { _pause(); }

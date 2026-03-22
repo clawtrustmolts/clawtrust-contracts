@@ -22,60 +22,6 @@ import "./interfaces/IERC8004Identity.sol";
  *         5. REPLAY PROTECTION — Signature timestamp + chain ID + signature hash used.
  *         6. EMERGENCY PAUSE   — Admin can freeze mint/update instantly.
  */
-/*
- * ══════════════════════════════════════════════════════════════
- * SECURITY AUDIT FINDINGS — ClawCardNFT
- * Audit date : 2026-03-12
- * Auditor    : Internal (ClawTrust core team)
- * Severity key: [C]ritical [H]igh [M]edium [L]ow [I]nfo
- * ══════════════════════════════════════════════════════════════
- *
- * [I-01] Soulbound enforcement is comprehensive.
- *   transferFrom, safeTransferFrom, approve, setApprovalForAll, and
- *   _update all revert unconditionally. No bypass path exists.
- *   STATUS: PASS — no action needed.
- *
- * [L-01] walletToTokenId uses 0 as "not minted" sentinel.
- *   tokenId 0 is never minted (_nextTokenId starts at 1). If the
- *   counter were ever changed to start at 0 this invariant would break.
- *   STATUS: ACCEPTED — invariant is enforced by _nextTokenId = 1.
- *
- * [L-02] UPDATE_COOLDOWN check uses strict < comparison.
- *   block.timestamp < lastUpdated + 1 hour.  Updates are allowed once
- *   block.timestamp >= lastUpdated + 3600 (exactly 1 hour is permitted).
- *   STATUS: PASS — correct behavior.
- *
- * [I-02] Oracle signature uses chain ID for cross-chain replay protection.
- *   abi.encodePacked includes block.chainid.
- *   STATUS: PASS.
- *
- * [I-03] AccessControl roles (MINTER, ORACLE, PAUSER) are properly gated.
- *   All privileged functions use onlyRole modifiers.
- *   STATUS: PASS.
- *
- * [L-03] _usedSigHashes grows unboundedly.
- *   Old signature hashes are never pruned. Over millions of updates
- *   this could increase storage reads marginally but has no functional
- *   impact as the mapping is O(1) lookup.
- *   STATUS: ACCEPTED — no practical DoS vector.
- *
- * [I-04] ReentrancyGuard on mint; no external calls after state change
- *   in updateReputation.
- *   STATUS: PASS.
- *
- * [I-05] MAX_SUPPLY = 1,000,000 cap enforced in _mintPassport.
- *   STATUS: PASS.
- *
- * [M-01] Future-dated oracle signatures accepted.
- *   The freshness check only enforces block.timestamp <= sigTimestamp +
- *   SIG_FRESHNESS_WINDOW, but does not reject sigTimestamp > block.timestamp.
- *   An oracle could pre-sign with a future timestamp, creating long-lived
- *   signatures that bypass the intended short freshness window.
- *   STATUS: FIXED — added sigTimestamp <= block.timestamp check.
- *
- * OVERALL: No critical or high findings. Contract is production-ready.
- * ══════════════════════════════════════════════════════════════
- */
 contract ClawCardNFT is ERC721, AccessControl, Pausable, ReentrancyGuard, IERC8004Identity {
     using Strings for uint256;
 
@@ -87,7 +33,8 @@ contract ClawCardNFT is ERC721, AccessControl, Pausable, ReentrancyGuard, IERC80
     string  public  baseTokenURI;
     uint256 public  constant MAX_SUPPLY         = 1_000_000;
     uint256 public  constant UPDATE_COOLDOWN    = 1 hours;
-    uint256 public  constant SIG_FRESHNESS_WINDOW = 5 minutes;
+    uint256 public  constant MAX_SKILLS           = 50;
+    uint256 public  sigFreshnessWindow            = 5 minutes;
     uint256 public  constant MAX_FUSED_SCORE    = 10_000;
 
     // ─── On-chain Passport Data ──────────────────────────────────────
@@ -98,10 +45,10 @@ contract ClawCardNFT is ERC721, AccessControl, Pausable, ReentrancyGuard, IERC80
         string[]skills;            // capability list
         uint8   tier;              // 0=Hatchling … 4=Diamond Claw
         uint256 fusedScore;        // 0-10000 (scaled ×100 for precision)
-        uint256 onChainScore;      // 45% component
-        uint256 moltbookScore;     // 25% component
-        uint256 performanceScore;  // 20% component
-        uint256 bondScore;         // 10% component
+        uint256 onChainScore;      // 30% component
+        uint256 moltbookScore;     // 15% component
+        uint256 performanceScore;  // 35% component
+        uint256 bondScore;         // 20% component
         uint256 gigsCompleted;     // oracle-verified count
         uint256 totalEarnedUsdc;   // USDC base units
         uint256 riskIndex;         // 0-100
@@ -240,6 +187,7 @@ contract ClawCardNFT is ERC721, AccessControl, Pausable, ReentrancyGuard, IERC80
         if (bytes(agentId).length == 0) revert InvalidAgentId();
         if (handleUsed[agentId]) revert AgentIdInUse();
         if (_nextTokenId > MAX_SUPPLY) revert MaxSupplyReached();
+        if (skills.length > MAX_SKILLS) revert InvalidScore();
 
         uint256 tokenId = _nextTokenId++;
         _mint(to, tokenId);
@@ -307,7 +255,7 @@ contract ClawCardNFT is ERC721, AccessControl, Pausable, ReentrancyGuard, IERC80
         if (tier > 4) revert InvalidTier();
         if (riskIndex > 100) revert InvalidRiskIndex();
         if (sigTimestamp > block.timestamp) revert SignatureExpired();
-        if (block.timestamp > sigTimestamp + SIG_FRESHNESS_WINDOW) revert SignatureExpired();
+        if (block.timestamp > sigTimestamp + sigFreshnessWindow) revert SignatureExpired();
         if (block.timestamp < passports[tokenId].lastUpdated + UPDATE_COOLDOWN) revert UpdateTooFrequent();
 
         bytes32 msgHash = keccak256(abi.encodePacked(
@@ -508,6 +456,29 @@ contract ClawCardNFT is ERC721, AccessControl, Pausable, ReentrancyGuard, IERC80
 
     function revokeMinter(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _revokeRole(MINTER_ROLE, account);
+    }
+
+    /**
+     * @notice Mint a passport to any address. Requires MINTER_ROLE.
+     */
+    function mintTo(address to, string calldata agentId) external onlyRole(MINTER_ROLE) whenNotPaused nonReentrant {
+        _mintPassport(to, agentId, "", new string[](0));
+    }
+
+    /**
+     * @notice Returns the current chain ID.
+     */
+    function getChainId() external view returns (uint256) {
+        return block.chainid;
+    }
+
+    /**
+     * @notice Update the signature freshness window. Admin only.
+     * @param window New window in seconds (1 minute to 1 hour).
+     */
+    function setSigFreshnessWindow(uint256 window) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (window < 1 minutes || window > 1 hours) revert InvalidScore();
+        sigFreshnessWindow = window;
     }
 
     function lockAsSoulbound(uint256) external pure {

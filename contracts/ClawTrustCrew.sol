@@ -1,53 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/*
- * ══════════════════════════════════════════════════════════════
- * SECURITY AUDIT FINDINGS — ClawTrustCrew
- * Audit date : 2026-03-12
- * Auditor    : Internal (ClawTrust core team)
- * Severity key: [C]ritical [H]igh [M]edium [L]ow [I]nfo
- * ══════════════════════════════════════════════════════════════
- *
- * [I-01] ReentrancyGuard inherited (no payable/external-call paths
- *   currently, but future-proofs the contract).
- *   STATUS: PASS.
- *
- * [I-02] MAX_MEMBERS = 10, MIN_MEMBERS = 2 enforced on formCrew,
- *   addMember, removeMember.
- *   STATUS: PASS.
- *
- * [L-01] Ownable (single-step) used instead of Ownable2Step.
- *   STATUS: ACCEPTED — owner is a known deployer wallet.
- *
- * [L-02] agentCrew mapping prevents multi-crew membership.
- *   An agent removed from a crew via removeMember gets agentCrew
- *   deleted, freeing them to join another crew. Dissolved crew
- *   members also get freed. No orphan state possible.
- *   STATUS: PASS.
- *
- * [I-03] DuplicateCandidate check in formCrew prevents double-counting.
- *   STATUS: PASS.
- *
- * [L-03] removeMember uses swap-and-pop on memberAddresses array.
- *   This changes member ordering, which is acceptable for an
- *   unordered set. No gas DoS risk since MAX_MEMBERS = 10.
- *   STATUS: ACCEPTED.
- *
- * [I-04] onlyCrewLead modifier validates crewExists, lead == sender,
- *   and crew.active on every privileged call.
- *   STATUS: PASS.
- *
- * [I-05] No ETH or ERC-20 held by this contract.
- *   STATUS: PASS — no fund extraction risk.
- *
- * OVERALL: No critical or high findings. Contract is production-ready.
- * ══════════════════════════════════════════════════════════════
- */
-contract ClawTrustCrew is Ownable, ReentrancyGuard {
+contract ClawTrustCrew is Ownable2Step, ReentrancyGuard {
     enum Role { LEAD, RESEARCHER, CODER, DESIGNER, VALIDATOR }
 
     struct CrewMember {
@@ -81,6 +38,7 @@ contract ClawTrustCrew is Ownable, ReentrancyGuard {
     mapping(bytes32 => Crew) internal crews;
     mapping(bytes32 => bool) public crewExists;
     mapping(address => bytes32) public agentCrew;
+    mapping(address => bool) public authorizedCallers;
     uint256 public crewCount;
 
     uint256 public constant MIN_MEMBERS = 2;
@@ -105,6 +63,15 @@ contract ClawTrustCrew is Ownable, ReentrancyGuard {
     error InvalidRole();
     error DuplicateMember();
     error ArrayLengthMismatch();
+    error NotAuthorizedCaller();
+
+    event CallerAuthorized(address indexed caller);
+    event CallerRevoked(address indexed caller);
+
+    modifier onlyAuthorized() {
+        if(!authorizedCallers[msg.sender] && msg.sender != owner()) revert NotAuthorizedCaller();
+        _;
+    }
 
     modifier onlyCrewLead(bytes32 crewId) {
         if(!crewExists[crewId]) revert CrewNotFound();
@@ -211,13 +178,15 @@ contract ClawTrustCrew is Ownable, ReentrancyGuard {
         for(uint256 i = 0; i < crew.memberAddresses.length; i++) {
             delete agentCrew[crew.memberAddresses[i]];
         }
+        // Belt-and-suspenders: also clear lead even if not in memberAddresses
+        delete agentCrew[crew.lead];
 
         crew.active = false;
 
         emit CrewDissolved(crewId, msg.sender);
     }
 
-    function recordGigCompletion(bytes32 crewId) external onlyOwner {
+    function recordGigCompletion(bytes32 crewId) external onlyAuthorized {
         if(!crewExists[crewId]) revert CrewNotFound();
         if(!crews[crewId].active) revert CrewNotActive();
 
@@ -268,5 +237,16 @@ contract ClawTrustCrew is Ownable, ReentrancyGuard {
 
     function getAgentCrew(address agent) external view returns (bytes32) {
         return agentCrew[agent];
+    }
+
+    function authorizeCaller(address caller) external onlyOwner {
+        if(caller == address(0)) revert InvalidAddress();
+        authorizedCallers[caller] = true;
+        emit CallerAuthorized(caller);
+    }
+
+    function revokeCaller(address caller) external onlyOwner {
+        authorizedCallers[caller] = false;
+        emit CallerRevoked(caller);
     }
 }

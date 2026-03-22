@@ -27,55 +27,6 @@ import "./interfaces/IClawTrustContracts.sol";
  *   ClawTrustBond:          0x23a1E1e958C932639906d0650A13283f6E60132c
  *   USDC (Base Sepolia):    0x036CbD53842c5426634e7929541eC2318f3dCF7e
  */
-/*
- * ══════════════════════════════════════════════════════════════
- * SECURITY AUDIT FINDINGS — ClawTrustAC
- * Audit date : 2026-03-12
- * Auditor    : Internal (ClawTrust core team)
- * Severity key: [C]ritical [H]igh [M]edium [L]ow [I]nfo
- * ══════════════════════════════════════════════════════════════
- *
- * [I-01] Ownable2Step used for ownership transfer.
- *   Two-step transfer prevents accidental ownership loss.
- *   STATUS: PASS.
- *
- * [I-02] ReentrancyGuard on all fund-moving functions (fund, complete,
- *   reject, cancel, expireJob, emergencyWithdraw).
- *   STATUS: PASS.
- *
- * [I-03] SafeERC20 used for all USDC transfers.
- *   STATUS: PASS.
- *
- * [L-01] jobId generated from keccak256(sender, counter, timestamp).
- *   Collision probability is negligible but theoretically non-zero.
- *   A sequential counter alone would suffice.
- *   STATUS: ACCEPTED — collision requires identical sender + counter +
- *   timestamp which is impossible due to _jobCounter increment.
- *
- * [L-02] evaluator is a single address, not a multi-sig.
- *   If compromised, attacker can complete/reject any submitted job.
- *   Mitigated by owner() also having complete/reject authority.
- *   STATUS: ACCEPTED — evaluator is the ClawTrust oracle; rotatable
- *   via setEvaluator().
- *
- * [I-04] Self-dealing prevented: provider != client enforced.
- *   STATUS: PASS.
- *
- * [I-05] ERC-8004 registration check on assignProvider.
- *   Provider must hold a ClawCard passport (isRegistered).
- *   STATUS: PASS.
- *
- * [L-03] emergencyWithdraw can extract any ERC-20 token.
- *   Owner can drain USDC held in escrow for active jobs.
- *   STATUS: ACCEPTED — intended emergency hatch; Ownable2Step limits
- *   access. Document in operational runbook.
- *
- * [I-06] Pausable on all state-changing functions.
- *   STATUS: PASS.
- *
- * OVERALL: No critical or high findings. Contract is production-ready.
- * ══════════════════════════════════════════════════════════════
- */
 contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
@@ -97,6 +48,7 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public constant MIN_BUDGET = 1e4;
     uint256 public constant MIN_DURATION = 1 hours;
     uint256 public constant MAX_DURATION = 90 days;
+    uint256 public constant DISPUTE_WINDOW = 48 hours;
 
     // ═══════════════════════════════════════════════════════════
     // STATE
@@ -116,6 +68,7 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     mapping(bytes32 => Job) public jobs;
+    mapping(bytes32 => uint256) public submittedAt;
     uint256 private _jobCounter;
 
     address public treasury;
@@ -190,6 +143,7 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
     ) external override whenNotPaused returns (bytes32 jobId) {
         if (budget < MIN_BUDGET) revert InvalidAmount();
         if (durationSeconds < MIN_DURATION || durationSeconds > MAX_DURATION) revert InvalidDuration();
+        if (bytes(description).length > 1000) revert InvalidAmount();
 
         _jobCounter++;
         jobId = keccak256(abi.encodePacked(msg.sender, _jobCounter, block.timestamp));
@@ -229,8 +183,6 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
         usdc.safeTransferFrom(msg.sender, address(this), job.budget);
         job.status = JobStatus.Funded;
 
-        totalVolumeUSDC += job.budget;
-
         emit JobFunded(jobId, msg.sender, job.budget);
     }
 
@@ -252,6 +204,7 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
         if (!clawCard.isRegistered(provider)) revert ProviderNotRegistered();
 
         job.provider = provider;
+        job.status = JobStatus.Assigned;
 
         emit JobProviderAssigned(jobId, provider);
     }
@@ -264,12 +217,13 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
     function submit(bytes32 jobId, bytes32 deliverableHash) external override whenNotPaused {
         Job storage job = jobs[jobId];
         if (job.client == address(0)) revert JobNotFound();
-        if (job.status != JobStatus.Funded) revert InvalidStatus();
+        if (job.status != JobStatus.Assigned) revert InvalidStatus();
         if (msg.sender != job.provider) revert Unauthorized();
         if (block.timestamp >= job.expiredAt) revert JobAlreadyExpired();
 
         job.deliverableHash = deliverableHash;
         job.status = JobStatus.Submitted;
+        submittedAt[jobId] = block.timestamp;
 
         emit JobSubmitted(jobId, msg.sender, deliverableHash);
     }
@@ -281,7 +235,9 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
      * @param reason bytes32 attestation reason (e.g. keccak of "SWARM_APPROVED")
      */
     function complete(bytes32 jobId, bytes32 reason) external override nonReentrant whenNotPaused {
-        if (msg.sender != evaluator && msg.sender != owner()) revert Unauthorized();
+        if (msg.sender != evaluator && msg.sender != owner()) {
+            if (block.timestamp < submittedAt[jobId] + DISPUTE_WINDOW) revert Unauthorized();
+        }
 
         Job storage job = jobs[jobId];
         if (job.client == address(0)) revert JobNotFound();
@@ -300,6 +256,7 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
         usdc.safeTransfer(job.provider, payout);
 
         totalJobsCompleted++;
+        totalVolumeUSDC += job.budget;
 
         emit JobCompleted(jobId, job.provider, reason);
     }
@@ -336,7 +293,7 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
         if (msg.sender != job.client && msg.sender != owner()) revert Unauthorized();
         if (job.status != JobStatus.Open && job.status != JobStatus.Funded) revert InvalidStatus();
 
-        bool wasFunded = job.status == JobStatus.Funded;
+        bool wasFunded = (job.status == JobStatus.Funded);
         job.status = JobStatus.Cancelled;
 
         if (wasFunded) {
@@ -355,10 +312,10 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
         Job storage job = jobs[jobId];
         if (job.client == address(0)) revert JobNotFound();
         if (block.timestamp < job.expiredAt) revert JobNotExpired();
-        if (job.status != JobStatus.Open && job.status != JobStatus.Funded && job.status != JobStatus.Submitted)
+        if (job.status != JobStatus.Open && job.status != JobStatus.Funded && job.status != JobStatus.Assigned && job.status != JobStatus.Submitted)
             revert InvalidStatus();
 
-        bool hadFunds = job.status == JobStatus.Funded || job.status == JobStatus.Submitted;
+        bool hadFunds = job.status == JobStatus.Funded || job.status == JobStatus.Assigned || job.status == JobStatus.Submitted;
         job.status = JobStatus.Expired;
 
         if (hadFunds) {
@@ -441,6 +398,13 @@ contract ClawTrustAC is IERC8183, Ownable2Step, ReentrancyGuard, Pausable {
 
     function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner nonReentrant {
         if (to == address(0)) revert InvalidAddress();
+        if (token == address(usdc)) revert Unauthorized();
         IERC20(token).safeTransfer(to, amount);
+    }
+
+    function recoverStuckUSDC(address to) external onlyOwner nonReentrant {
+        if (to == address(0)) revert InvalidAddress();
+        uint256 balance = usdc.balanceOf(address(this));
+        usdc.safeTransfer(to, balance);
     }
 }

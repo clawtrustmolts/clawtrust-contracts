@@ -20,7 +20,7 @@ describe("ClawTrustRepAdapter", function () {
       const score = await adapter.computeFusedScore(890, 4200, 75, 80);
       const normalizedOnChain = (890n * 100n) / 1000n;
       const normalizedMoltbook = (4200n * 100n) / 10000n;
-      const expected = (45n * normalizedOnChain + 25n * normalizedMoltbook + 20n * 75n + 10n * 80n) / 100n;
+      const expected = (30n * normalizedOnChain + 15n * normalizedMoltbook + 35n * 75n + 20n * 80n) / 100n;
       expect(score).to.equal(expected);
     });
 
@@ -122,7 +122,7 @@ describe("ClawTrustRepAdapter", function () {
         [5000, 6000],
         [75, 80],
         [80, 90],
-        ["ipfs://p1", "ipfs://p2"]
+        ["ipfs://proof-001", "ipfs://p2"]
       );
       const s1 = await adapter.getFusedScore(addr1.address);
       const s2 = await adapter.getFusedScore(addr2.address);
@@ -143,7 +143,7 @@ describe("ClawTrustRepAdapter", function () {
         karmas.push(1000);
         perfScores.push(50);
         bondScores.push(50);
-        proofs.push("ipfs://p");
+        proofs.push("ipfs://p00");
       }
       await expect(
         adapter.connect(oracle).updateFusedScoreBatch(addrs, onChainScores, karmas, perfScores, bondScores, proofs)
@@ -153,7 +153,7 @@ describe("ClawTrustRepAdapter", function () {
     it("should revert on array length mismatch", async function () {
       await expect(
         adapter.connect(oracle).updateFusedScoreBatch(
-          [agent.address], [500, 600], [5000], [75], [80], ["ipfs://p1"]
+          [agent.address], [500, 600], [5000], [75], [80], ["ipfs://proof-001"]
         )
       ).to.be.revertedWithCustomError(adapter, "InvalidScore");
     });
@@ -161,7 +161,7 @@ describe("ClawTrustRepAdapter", function () {
 
   describe("score history", function () {
     it("should track history", async function () {
-      await adapter.connect(oracle).updateFusedScore(agent.address, 500, 5000, 75, 80, "ipfs://p1");
+      await adapter.connect(oracle).updateFusedScore(agent.address, 500, 5000, 75, 80, "ipfs://proof-001");
       const len = await adapter.getHistoryLength(agent.address);
       expect(len).to.equal(1);
       const history = await adapter.getScoreHistory(agent.address, 0, 10);
@@ -169,7 +169,7 @@ describe("ClawTrustRepAdapter", function () {
     });
 
     it("should paginate history", async function () {
-      await adapter.connect(oracle).updateFusedScore(agent.address, 500, 5000, 75, 80, "ipfs://p1");
+      await adapter.connect(oracle).updateFusedScore(agent.address, 500, 5000, 75, 80, "ipfs://proof-001");
       const history = await adapter.getScoreHistory(agent.address, 10, 10);
       expect(history.length).to.equal(0);
     });
@@ -179,10 +179,10 @@ describe("ClawTrustRepAdapter", function () {
     it("should pause and unpause", async function () {
       await adapter.pause();
       await expect(
-        adapter.connect(oracle).updateFusedScore(agent.address, 500, 5000, 75, 80, "ipfs://p1")
+        adapter.connect(oracle).updateFusedScore(agent.address, 500, 5000, 75, 80, "ipfs://proof-001")
       ).to.be.revertedWithCustomError(adapter, "EnforcedPause");
       await adapter.unpause();
-      await adapter.connect(oracle).updateFusedScore(agent.address, 500, 5000, 75, 80, "ipfs://p1");
+      await adapter.connect(oracle).updateFusedScore(agent.address, 500, 5000, 75, 80, "ipfs://proof-001");
     });
   });
 
